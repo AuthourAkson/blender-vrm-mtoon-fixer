@@ -23,6 +23,7 @@
 - `scripts/vrm_material_fixer.py`:Blender Python 命令行批量脚本
 - `scripts/run_fix.bat`:Windows 拖拽一键运行入口
 - `scripts/build_addon_zip.py`:把插件打包成可安装 zip(出 Release 用)
+- `scripts/normalize_rig_frames.py`:把 MMD 装备骨的 helper 骨骼朝向规范化(修 Unity 侧应用里「头部一直朝下」), 已集成进插件面板
 
 ## 安装到其他智能体
 
@@ -45,3 +46,14 @@ python scripts/build_addon_zip.py
 ```
 
 会在 `dist/` 生成 `vrm_mtoon_fixer-<版本>.zip`,版本号取自插件里的 `bl_info["version"]`。
+
+## 骨骼朝向规范化(Unity 应用兼容)
+
+MMD 完整装备骨(`腰` / `上半身1` / `肩P` / `肩C` / 捩骨 …)会让某些人形骨骼的
+「相对父级的局部静止旋转」很大(实测某模型 `上半身` 相对 `腰` 偏 42.72°)。
+MATE ENGINE 等 Unity 侧应用会假定这个值是 0 并直接覆盖它, 结果躯干连带头部前倾
+—— 表现就是「头部一直朝下」。
+
+插件面板勾选 `导出前规范化骨骼朝向`(默认开)即可在导出前自动对齐;
+也可以点 `规范化骨骼朝向(Unity 应用兼容)` 单独执行。只动 helper 骨骼朝向,
+模型外观与 Unity 人形重定向完全不变(实测世界位置差 0.001mm、朝向差 0.08°)。

@@ -13,6 +13,7 @@ Blender 一键修复: 把 MMD/PMX 模型的 mmd_shader / MBTs-NG 卡渲材质转
         3. 再点「一键修复并导出 VRM」按钮(转换 + 导出)
 """
 import importlib
+import math
 import os
 import traceback
 import unicodedata
@@ -25,7 +26,7 @@ from bpy.types import Operator, Panel
 bl_info = {
     "name": "VRM MToon Material Fixer",
     "author": "AI assistant (custom tool)",
-    "version": (1, 2, 0),
+    "version": (1, 3, 0),
     "blender": (3, 6, 0),
     "location": "3D Viewport > Sidebar > VRM Fixer",
     "description": "把 mmd_shader / MMDShaderDev / MBTs-NG 卡渲材质转换为 VRM MToon1 并导出 VRM",
@@ -262,6 +263,165 @@ def set_vrm1_meta(ext_mod, armature_obj, fallback_name):
         pass
 
 
+# ---------------------------------------------------------------------------
+# 骨骼朝向规范化(Unity / VRM 应用兼容)
+# ---------------------------------------------------------------------------
+# 背景: MMD 完整装备骨(センター / グルーブ / 腰 / 上半身1 / 上半身2 / 肩P / 肩C / 捩骨)
+# 里, 人形骨骼的"直接父级"常是这种 helper 骨骼, 而且它们的静止朝向不一定竖直。
+# 于是「人形骨骼相对父级的静止旋转」可能很大(实测 lothe 的 上半身 相对 腰 偏 42.72°)。
+#
+# 一些 Unity 侧 VRM 应用(例如 MATE ENGINE 的 AvatarMouseTracking.DoSpine/DoHead)
+# 假定这个局部初始旋转≈0, 而且会直接覆盖它 —— 结果躯干连带头部整体前倾("头一直朝下")。
+#
+# 这里把 helper 父骨骼的静止朝向对齐到它的人形子骨骼上, 让局部旋转≈0。
+# 只动 helper(非人形)骨骼的朝向: 不动骨骼头部位置、不动人形骨骼自身朝向;
+# 静止姿势下网格形变矩阵恒为单位阵, 所以模型外观与 Unity 的人形重定向都不受影响。
+
+
+def get_humanoid_bone_map(armature_obj):
+    """返回 {人形骨骼字段名(hips/spine/...): Blender 骨骼名}"""
+    ext_mod = get_vrm_extension_module()
+    if not ext_mod:
+        return {}
+    try:
+        ext = ext_mod.get_armature_extension(armature_obj.data)
+        if ext.is_vrm0():
+            out = {}
+            for entry in ext.vrm0.humanoid.human_bones:
+                node = getattr(entry, "node", None)
+                bone_name = getattr(node, "bone_name", "")
+                field = getattr(entry, "bone", "")
+                if field and bone_name:
+                    out[field] = bone_name
+            return out
+        out = {}
+        human_bones = ext.vrm1.humanoid.human_bones
+        for field in dir(human_bones):
+            if field.startswith("_"):
+                continue
+            node = getattr(getattr(human_bones, field, None), "node", None)
+            bone_name = getattr(node, "bone_name", "")
+            if bone_name:
+                out[field] = bone_name
+        return out
+    except Exception:
+        traceback.print_exc()
+        return {}
+
+
+def _relative_rest_angle(armature_obj, bone_name, parent_name):
+    """bone 相对 parent 的静止旋转角度(度)。应用覆盖该骨骼局部旋转时会跑偏这么多。"""
+    bones = armature_obj.data.bones
+    if bone_name not in bones or parent_name not in bones:
+        return None
+    bone_m = bones[bone_name].matrix_local
+    parent_m = bones[parent_name].matrix_local
+    rel = parent_m.inverted() @ bone_m
+    return math.degrees(rel.to_quaternion().angle)
+
+
+def scan_helper_frame_issues(armature_obj, tolerance=1.0):
+    """找出父级不是人形骨骼的人形骨骼, 以及其局部静止旋转偏差。"""
+    humanoid_map = get_humanoid_bone_map(armature_obj)
+    if not humanoid_map:
+        return [], humanoid_map
+    humanoid_bone_names = set(humanoid_map.values())
+    bones = armature_obj.data.bones
+    issues = []
+    for field, bone_name in sorted(humanoid_map.items()):
+        bone = bones.get(bone_name)
+        if bone is None or bone.parent is None:
+            continue
+        parent = bone.parent
+        if parent.name in humanoid_bone_names:
+            continue
+        angle = _relative_rest_angle(armature_obj, bone_name, parent.name)
+        if angle is None or angle <= tolerance:
+            continue
+        issues.append({
+            "humanoid": field,
+            "bone": bone_name,
+            "parent": parent.name,
+            "angle": angle,
+        })
+    return issues, humanoid_map
+
+
+def normalize_helper_frames(context, tolerance=1.0):
+    """把 helper 父骨骼的静止朝向对齐到其人形子骨骼。返回 (修改数, 日志)。"""
+    armature_obj, _body_obj = find_model_objects()
+    if armature_obj is None:
+        return 0, ["找不到骨骼对象"]
+    try:
+        if context.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+    except Exception:
+        pass
+
+    issues, _ = scan_helper_frame_issues(armature_obj, tolerance=tolerance)
+    if not issues:
+        return 0, ["骨骼朝向已规范(人形骨骼的父级都是人形骨骼), 无需处理"]
+
+    infos = [f"  {i['humanoid']:<16} {i['bone']} <- {i['parent']} "
+             f"静止偏差 {i['angle']:6.2f}°" for i in issues]
+
+    prev_active = context.view_layer.objects.active
+    changed = 0
+    try:
+        bpy.ops.object.select_all(action="DESELECT")
+        armature_obj.select_set(True)
+        context.view_layer.objects.active = armature_obj
+        bpy.ops.object.mode_set(mode="EDIT")
+        edit_bones = armature_obj.data.edit_bones
+        for item in issues:
+            parent_eb = edit_bones.get(item["parent"])
+            child_eb = edit_bones.get(item["bone"])
+            if parent_eb is None or child_eb is None:
+                continue
+            child_m = child_eb.matrix.to_3x3()
+            child_dir = child_m.col[1].normalized()
+            child_roll_ref = child_m.col[2].normalized()
+            head = parent_eb.head.copy()
+            length = parent_eb.length
+            parent_eb.tail = head + child_dir * length
+            parent_eb.align_roll(child_roll_ref)
+            changed += 1
+        bpy.ops.object.mode_set(mode="OBJECT")
+    except Exception as exc:
+        try:
+            bpy.ops.object.mode_set(mode="OBJECT")
+        except Exception:
+            pass
+        infos.append(f"  规范化失败: {exc}")
+        traceback.print_exc()
+    finally:
+        try:
+            context.view_layer.objects.active = prev_active
+        except Exception:
+            pass
+
+    for item in issues:
+        left = _relative_rest_angle(armature_obj, item["bone"], item["parent"])
+        if left is not None:
+            infos.append(f"  {item['bone']} 相对 {item['parent']}: "
+                         f"{item['angle']:.2f}° -> {left:.2f}°")
+    return changed, infos
+
+
+def maybe_normalize_rig(context):
+    """按场景开关执行骨骼朝向规范化, 返回日志行。"""
+    lines = []
+    try:
+        if not bool(getattr(context.scene, "vrm_fixer_normalize_rig", True)):
+            return lines
+    except Exception:
+        return lines
+    changed, report = normalize_helper_frames(context)
+    lines.append(f"骨骼朝向规范化: 处理 {changed} 根 helper 骨骼")
+    lines.extend(report)
+    return lines
+
+
 def bake_mbts_and_export(context, output_path):
     """B 方案: 用 Cycles 把 MBTs 卡渲材质烘成贴图, 再转换 MToon 并导出 VRM。"""
     ext_mod = get_vrm_extension_module()
@@ -408,6 +568,9 @@ def bake_mbts_and_export(context, output_path):
 
         set_vrm1_meta(ext_mod, armature_obj, os.path.splitext(os.path.basename(output_path))[0] or "VRM_Model")
 
+        for _rig_line in maybe_normalize_rig(context):
+            print(f"[VRM Fixer] {_rig_line}")
+
         bpy.ops.export_scene.vrm(
             filepath=output_path,
             armature_object_name=armature_obj.name,
@@ -549,6 +712,28 @@ class VRMFIXER_OT_AutoBindExpressions(Operator):
         return {"FINISHED"}
 
 
+class VRMFIXER_OT_NormalizeRig(Operator):
+    """把 MMD 装备骨里夹在人形骨骼之间的 helper 骨骼朝向规范化"""
+
+    bl_idname = "vrm_fixer.normalize_rig"
+    bl_label = "规范化骨骼朝向(Unity 应用兼容)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(bpy.data.objects)
+
+    def execute(self, context):
+        changed, infos = normalize_helper_frames(context)
+        for line in infos:
+            print(f"[VRM Fixer] {line}")
+        if changed == 0:
+            self.report({"INFO"}, infos[0] if infos else "无需处理")
+            return {"FINISHED"}
+        self.report({"INFO"}, f"已规范化 {changed} 根 helper 骨骼, 详情见控制台")
+        return {"FINISHED"}
+
+
 class VRMFIXER_OT_ConvertMaterials(Operator):
     bl_idname = "vrm_fixer.convert_materials"
     bl_label = "转换材质为 VRM MToon1 (兼容 MBTs 卡渲)"
@@ -636,6 +821,9 @@ class VRMFIXER_OT_ConvertAndExport(Operator):
             self.report({"ERROR"}, "导出失败: 找不到骨骼")
             return {"CANCELLED"}
 
+        for _rig_line in maybe_normalize_rig(context):
+            print(f"[VRM Fixer] {_rig_line}")
+
         bpy.ops.export_scene.vrm(
             filepath=output_path,
             armature_object_name=armature_obj.name,
@@ -670,6 +858,8 @@ class VRMFIXER_PT_Panel(Panel):
         layout.prop(scene, "vrm_fixer_mode", text="导出模式")
         layout.prop(scene, "vrm_fixer_auto_bind_expressions", text="导出前自动绑定 VRM1 表情")
         layout.operator(VRMFIXER_OT_AutoBindExpressions.bl_idname)
+        layout.prop(scene, "vrm_fixer_normalize_rig", text="导出前规范化骨骼朝向")
+        layout.operator(VRMFIXER_OT_NormalizeRig.bl_idname)
         layout.prop(scene, "vrm_fixer_output_path", text="输出 VRM")
         layout.operator(VRMFIXER_OT_ConvertMaterials.bl_idname)
         layout.operator(VRMFIXER_OT_ConvertAndExport.bl_idname, icon="EXPORT")
@@ -685,6 +875,7 @@ class VRMFIXER_PT_Panel(Panel):
 
 CLASSES = (
     VRMFIXER_OT_AutoBindExpressions,
+    VRMFIXER_OT_NormalizeRig,
     VRMFIXER_OT_ConvertMaterials,
     VRMFIXER_OT_ConvertAndExport,
     VRMFIXER_PT_Panel,
@@ -705,6 +896,12 @@ def register():
         description="导出前自动把 VRM1 表情预设绑定到模型形状键",
         default=True,
     )
+    bpy.types.Scene.vrm_fixer_normalize_rig = BoolProperty(
+        name="导出前规范化骨骼朝向",
+        description="把 MMD 装备骨里夹在人形骨骼之间的 helper 骨骼朝向对齐, "
+                    "修复 Unity 侧应用里躯干/头部前倾(如 MATE ENGINE 里头部一直朝下)",
+        default=True,
+    )
     bpy.types.Scene.vrm_fixer_output_path = StringProperty(
         name="VRM 输出路径",
         description="导出目标, 支持 // 相对路径",
@@ -718,6 +915,8 @@ def unregister():
         del bpy.types.Scene.vrm_fixer_auto_bind_expressions
     if hasattr(bpy.types.Scene, "vrm_fixer_mode"):
         del bpy.types.Scene.vrm_fixer_mode
+    if hasattr(bpy.types.Scene, "vrm_fixer_normalize_rig"):
+        del bpy.types.Scene.vrm_fixer_normalize_rig
     if hasattr(bpy.types.Scene, "vrm_fixer_output_path"):
         del bpy.types.Scene.vrm_fixer_output_path
     for cls in reversed(CLASSES):
