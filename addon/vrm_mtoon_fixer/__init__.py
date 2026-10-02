@@ -20,13 +20,14 @@ import unicodedata
 import bmesh
 
 import bpy
+from mathutils import Vector
 from bpy.props import BoolProperty, EnumProperty, StringProperty
 from bpy.types import Operator, Panel
 
 bl_info = {
     "name": "VRM MToon Material Fixer",
     "author": "AI assistant (custom tool)",
-    "version": (1, 4, 0),
+    "version": (1, 5, 0),
     "blender": (3, 6, 0),
     "location": "3D Viewport > Sidebar > VRM Fixer",
     "description": "把 mmd_shader / MMDShaderDev / MBTs-NG 卡渲材质转换为 VRM MToon1 并导出 VRM",
@@ -591,6 +592,227 @@ def bake_mmd_inherit_bones(context):
     return changed, infos
 
 
+# ---------------------------------------------------------------------------
+# 从 MMD 刚体自动生成 VRM 弹簧骨
+# ---------------------------------------------------------------------------
+# MMD 里头发 / 披风 / 尾巴 / 鞋带这些是靠物理刚体驱动的, 但 VRM 没有 MMD 物理,
+# 需要写成 VRMC_springBone(弹簧骨) 才会在 Unity / MATE ENGINE 里摆动。
+#
+# 做法:
+#   1. 收集 mmd_tools 的刚体数据(obj["mmd_rigid"]):
+#        type 1 = 静态(只做碰撞体)  type 2/3 = 动态(需要弹簧骨)
+#   2. 动态刚体的骨骼按层级连成链; 遇到分叉就切开, 保证每根骨骼只属于一条弹簧
+#   3. 静态刚体 -> VRM 球形碰撞体(VRM 1.0 的弹簧骨碰撞体只有球),
+#      按 MMD 的碰撞组/掩码分配给对应的弹簧
+#   4. 半径取刚体网格包围盒(MMD 刚体对象本身就是按尺寸生成的网格)
+#
+# 参数: MMD 刚体被转换工具精简过, 往往没有质量/阻尼/重力数据,
+# 所以按部位给经验值, 并且**沿链逐节递减硬度**(根硬、梢软), 这样长链(尾巴/长发)
+# 会一节一节地弯, 而不是整根当刚体甩。
+
+# (关键字, 根硬度, 梢硬度, 阻尼, 重力, 命中半径缩放, 单链最大关节数)
+SPRING_PROFILES = (
+    ("tail", 1.0, 0.25, 0.60, 0.0, 0.6, 24),
+    ("hair", 1.2, 0.50, 0.40, 0.0, 1.0, 12),
+    ("hat_", 1.2, 0.70, 0.40, 0.0, 1.0, 8),
+    ("ear_", 1.2, 0.70, 0.40, 0.0, 1.0, 8),
+    ("cloak", 1.0, 0.40, 0.50, 0.0, 1.0, 12),
+    ("cape", 1.0, 0.40, 0.50, 0.0, 1.0, 12),
+    ("sleeve", 1.0, 0.40, 0.50, 0.0, 1.0, 12),
+    ("skirt", 1.0, 0.40, 0.50, 0.0, 1.0, 12),
+    ("shoelace", 1.2, 0.80, 0.50, 0.0, 1.0, 8),
+    ("paw_", 0.8, 0.40, 0.50, 0.0, 1.0, 8),
+    ("gs_", 1.0, 0.40, 0.50, 0.0, 1.0, 12),
+)
+SPRING_PROFILE_DEFAULT = (1.0, 0.50, 0.45, 0.0, 1.0, 12)
+SPRING_GRAVITY_DIR = (0.0, -1.0, 0.0)
+SPRING_COLLIDER_MIN = 0.01
+SPRING_COLLIDER_MAX = 0.5
+SPRING_HIT_MIN = 0.005
+SPRING_HIT_MAX = 0.1
+
+
+def spring_profile(root_bone_name):
+    """按链根骨骼名挑参数。"""
+    lowered = (root_bone_name or "").lower()
+    for keywords, root_s, tip_s, drag, grav, hit_scale, max_j in SPRING_PROFILES:
+        for kw in keywords.split("|"):
+            if kw in lowered:
+                return root_s, tip_s, drag, grav, hit_scale, max_j
+    return SPRING_PROFILE_DEFAULT
+
+
+def collect_mmd_rigid_bodies():
+    """收集 mmd_tools 刚体 -> {骨骼名: {...}}。同名取半径最大的那个。"""
+    by_bone = {}
+    for obj in bpy.data.objects:
+        if "mmd_rigid" not in obj.keys():
+            continue
+        rb = obj["mmd_rigid"]
+        try:
+            bone_name = rb.get("bone", "") or ""
+        except Exception:
+            bone_name = ""
+        if not bone_name:
+            continue
+        radius = 0.0
+        try:
+            if obj.type == "MESH" and obj.data and len(obj.data.vertices):
+                xs = [float(v[0]) for v in obj.bound_box]
+                ys = [float(v[1]) for v in obj.bound_box]
+                zs = [float(v[2]) for v in obj.bound_box]
+                radius = max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs)) / 2.0
+        except Exception:
+            radius = 0.0
+        try:
+            mask = [bool(b) for b in rb["collision_group_mask"]]
+        except Exception:
+            mask = []
+        info = {
+            "type": int(rb.get("type", 1)),
+            "shape": int(rb.get("shape", 0)),
+            "radius": radius,
+            "group": int(rb.get("collision_group_number", 0)),
+            "mask": mask,
+        }
+        prev = by_bone.get(bone_name)
+        if prev is None or radius > prev["radius"]:
+            by_bone[bone_name] = info
+    return by_bone
+
+
+def build_spring_chains(armature_obj, dynamic_bones):
+    """动态刚体骨骼按层级连成链; 分叉处切开, 保证每根骨骼只属于一条弹簧。"""
+    bones = armature_obj.data.bones
+    children = {}
+    for name in dynamic_bones:
+        b = bones.get(name)
+        if b is None:
+            continue
+        children[name] = [c.name for c in b.children if c.name in dynamic_bones]
+    roots = []
+    for name in dynamic_bones:
+        b = bones.get(name)
+        if b is None:
+            continue
+        if b.parent is None or b.parent.name not in dynamic_bones:
+            roots.append(name)
+
+    chains = []
+
+    def walk(name, chain):
+        chain = chain + [name]
+        kids = children.get(name, [])
+        if len(kids) == 1:
+            walk(kids[0], chain)
+            return
+        chains.append(chain)
+        for k in kids:
+            walk(k, [])
+
+    for r in sorted(roots):
+        walk(r, [])
+    return [c for c in chains if len(c) >= 2]
+
+
+def generate_spring_bones(context):
+    """生成 VRMC_springBone。返回 (弹簧数, 日志)。"""
+    armature_obj, _body_obj = find_model_objects()
+    if armature_obj is None:
+        return 0, ["找不到骨骼对象"]
+    ext_mod = get_vrm_extension_module()
+    if ext_mod is None:
+        return 0, ["找不到 VRM Addon"]
+
+    rigid = collect_mmd_rigid_bodies()
+    if not rigid:
+        return 0, ["没有找到 MMD 刚体数据(mmd_rigid), 跳过弹簧骨生成"]
+
+    static = {b: i for b, i in rigid.items() if i["type"] == 1}
+    dynamic = {b: i for b, i in rigid.items() if i["type"] != 1}
+    chains = build_spring_chains(armature_obj, set(dynamic))
+    try:
+        ext = ext_mod.get_armature_extension(armature_obj.data)
+        sb = ext.spring_bone1
+    except Exception as exc:
+        return 0, [f"VRM 弹簧骨扩展不可用: {exc}"]
+
+    sb.springs.clear()
+    sb.collider_groups.clear()
+    sb.colliders.clear()
+
+    infos = [f"  刚体骨骼 {len(rigid)} 根 (静态 {len(static)} / 动态 {len(dynamic)}), "
+             f"切出 {len(chains)} 条链"]
+
+    # ---- 静态刚体 -> 球形碰撞体 + 碰撞组 ----
+    collider_of_bone = {}
+    for bone_name, info in sorted(static.items()):
+        if bone_name not in armature_obj.data.bones:
+            continue
+        radius = info["radius"] or 0.05
+        c = sb.colliders.add()
+        try:
+            c.node.bone_name = bone_name
+            c.offset = Vector((0.0, 0.0, 0.0))
+            c.radius = float(min(max(radius, SPRING_COLLIDER_MIN), SPRING_COLLIDER_MAX))
+        except Exception:
+            continue
+        collider_of_bone[bone_name] = c
+
+    group_of_bone = {}
+    for bone_name, collider in collider_of_bone.items():
+        g = sb.collider_groups.add()
+        try:
+            g.vrm_name = ("CG_" + bone_name)[:60]
+            g.colliders.add().collider = collider
+        except Exception:
+            pass
+        group_of_bone[bone_name] = g
+
+    # ---- 动态骨骼链 -> 弹簧 ----
+    made = 0
+    for chain in chains:
+        root_s, tip_s, drag, gravity, hit_scale, max_joints = spring_profile(chain[0])
+        joints = chain[:max_joints]
+        sp = sb.springs.add()
+        try:
+            sp.vrm_name = ("SP_" + chain[0])[:60]
+        except Exception:
+            pass
+        span = max(1, len(joints) - 1)
+        for idx, bone_name in enumerate(joints):
+            info = dynamic[bone_name]
+            j = sp.joints.add()
+            try:
+                j.node.bone_name = bone_name
+            except Exception:
+                continue
+            t = idx / span
+            radius = (info["radius"] or 0.02) * 0.5 * hit_scale
+            j.hit_radius = float(min(max(radius, SPRING_HIT_MIN), SPRING_HIT_MAX))
+            j.stiffness = float(root_s + (tip_s - root_s) * t)
+            j.drag_force = float(drag)
+            j.gravity_power = float(gravity)
+            j.gravity_dir = Vector(SPRING_GRAVITY_DIR)
+        mask = dynamic[chain[0]]["mask"]
+        for bone_name, group in group_of_bone.items():
+            gnum = static[bone_name]["group"]
+            if mask and 0 <= gnum < len(mask) and not mask[gnum]:
+                continue
+            try:
+                sp.collider_groups.add().collider_group = group
+            except Exception:
+                pass
+        made += 1
+
+    infos.append(f"  已写入 springs={len(sb.springs)} 碰撞体={len(sb.colliders)} "
+                 f"碰撞组={len(sb.collider_groups)} 关节={sum(len(s.joints) for s in sb.springs)}")
+    for chain in chains[:8]:
+        r_s, t_s, _d, _g, _h, _m = spring_profile(chain[0])
+        infos.append(f"    {chain[0]:<30} {len(chain):2d} 节  硬度 {r_s:.2f}->{t_s:.2f}")
+    return made, infos
+
+
 def maybe_normalize_rig(context):
     """按场景开关执行骨骼朝向规范化, 返回日志行。"""
     lines = []
@@ -611,6 +833,15 @@ def maybe_normalize_rig(context):
     changed, report = normalize_helper_frames(context)
     lines.append(f"骨骼朝向规范化: 处理 {changed} 根 helper 骨骼")
     lines.extend(report)
+
+    try:
+        if bool(getattr(context.scene, "vrm_fixer_gen_spring_bones", True)):
+            made, spring_report = generate_spring_bones(context)
+            lines.append(f"生成 VRM 弹簧骨: {made} 条弹簧")
+            lines.extend(spring_report)
+    except Exception:
+        traceback.print_exc()
+        lines.append("生成 VRM 弹簧骨: 失败, 详见控制台")
     return lines
 
 
@@ -909,6 +1140,28 @@ class VRMFIXER_OT_AutoBindExpressions(Operator):
         return {"FINISHED"}
 
 
+class VRMFIXER_OT_GenerateSpringBones(Operator):
+    """从 MMD 物理(刚体/关节)自动生成 VRMC 弹簧骨"""
+
+    bl_idname = "vrm_fixer.generate_spring_bones"
+    bl_label = "从 MMD 物理生成弹簧骨"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(bpy.data.objects)
+
+    def execute(self, context):
+        made, infos = generate_spring_bones(context)
+        for line in infos:
+            print(f"[VRM Fixer] {line}")
+        if made == 0:
+            self.report({"WARNING"}, infos[0] if infos else "没有生成弹簧骨")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"已生成 {made} 条弹簧骨, 详情见控制台")
+        return {"FINISHED"}
+
+
 class VRMFIXER_OT_NormalizeRig(Operator):
     """把 MMD 装备骨里夹在人形骨骼之间的 helper 骨骼朝向规范化"""
 
@@ -1058,6 +1311,8 @@ class VRMFIXER_PT_Panel(Panel):
         layout.prop(scene, "vrm_fixer_bake_inherit", text="导出前烘焙 MMD 付与骨(修下半身僵住)")
         layout.prop(scene, "vrm_fixer_normalize_rig", text="导出前规范化骨骼朝向")
         layout.operator(VRMFIXER_OT_NormalizeRig.bl_idname)
+        layout.prop(scene, "vrm_fixer_gen_spring_bones", text="导出前生成弹簧骨(头发/披风/尾巴)")
+        layout.operator(VRMFIXER_OT_GenerateSpringBones.bl_idname)
         layout.prop(scene, "vrm_fixer_output_path", text="输出 VRM")
         layout.operator(VRMFIXER_OT_ConvertMaterials.bl_idname)
         layout.operator(VRMFIXER_OT_ConvertAndExport.bl_idname, icon="EXPORT")
@@ -1074,6 +1329,7 @@ class VRMFIXER_PT_Panel(Panel):
 CLASSES = (
     VRMFIXER_OT_AutoBindExpressions,
     VRMFIXER_OT_NormalizeRig,
+    VRMFIXER_OT_GenerateSpringBones,
     VRMFIXER_OT_ConvertMaterials,
     VRMFIXER_OT_ConvertAndExport,
     VRMFIXER_PT_Panel,
@@ -1100,6 +1356,11 @@ def register():
                     "否则导出 VRM 后这些部位(常见腿部/下半身)会僵在绑定姿势",
         default=True,
     )
+    bpy.types.Scene.vrm_fixer_gen_spring_bones = BoolProperty(
+        name="导出前生成弹簧骨",
+        description="从 MMD 刚体自动生成 VRMC 弹簧骨, 让头发/披风/尾巴等在 Unity 里摆动",
+        default=True,
+    )
     bpy.types.Scene.vrm_fixer_normalize_rig = BoolProperty(
         name="导出前规范化骨骼朝向",
         description="把 MMD 装备骨里夹在人形骨骼之间的 helper 骨骼朝向对齐, "
@@ -1121,6 +1382,8 @@ def unregister():
         del bpy.types.Scene.vrm_fixer_mode
     if hasattr(bpy.types.Scene, "vrm_fixer_bake_inherit"):
         del bpy.types.Scene.vrm_fixer_bake_inherit
+    if hasattr(bpy.types.Scene, "vrm_fixer_gen_spring_bones"):
+        del bpy.types.Scene.vrm_fixer_gen_spring_bones
     if hasattr(bpy.types.Scene, "vrm_fixer_normalize_rig"):
         del bpy.types.Scene.vrm_fixer_normalize_rig
     if hasattr(bpy.types.Scene, "vrm_fixer_output_path"):

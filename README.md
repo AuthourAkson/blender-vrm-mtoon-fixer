@@ -23,6 +23,7 @@
 - `scripts/vrm_material_fixer.py`:Blender Python 命令行批量脚本
 - `scripts/run_fix.bat`:Windows 拖拽一键运行入口
 - `scripts/build_addon_zip.py`:把插件打包成可安装 zip(出 Release 用)
+- `scripts/gen_spring_bones.py`:从 MMD 物理自动生成 VRM 弹簧骨(头发/披风/尾巴), 已集成进插件
 - `scripts/normalize_rig_frames.py`:把 MMD 装备骨的 helper 骨骼朝向规范化(修 Unity 侧应用里「头部一直朝下」), 已集成进插件面板
 
 ## 安装到其他智能体
@@ -59,3 +60,11 @@ MATE ENGINE 等 Unity 侧应用会假定这个值是 0 并直接覆盖它, 结�
 插件面板勾选 `导出前规范化骨骼朝向`(默认开)即可在导出前自动对齐;
 也可以点 `规范化骨骼朝向(Unity 应用兼容)` 单独执行。只动 helper 骨骼朝向,
 模型外观与 Unity 人形重定向完全不变(实测世界位置差 0.001mm、朝向差 0.08°)。
+
+## 弹簧骨(头发/披风/尾巴摆动)
+
+MMD 靠刚体物理驱动头发/披风/尾巴, VRM 没有这个机制, 需要写成 `VRMC_springBone`。
+插件读取 mmd_tools 的刚体数据自动生成: 动态刚体按骨骼层级连成链(分叉处切开,
+每根骨骼只属于一条弹簧), 静态刚体变成球形碰撞体并按 MMD 碰撞组/掩码分配;
+参数按部位给(尾巴/头发/帽子/披风/鞋带...), 并**沿链逐节递减硬度**, 长链才会一节节弯
+而不是整根甩。实测某模型: 33 条弹簧 / 222 关节 / 32 碰撞体。
