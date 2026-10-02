@@ -26,7 +26,7 @@ from bpy.types import Operator, Panel
 bl_info = {
     "name": "VRM MToon Material Fixer",
     "author": "AI assistant (custom tool)",
-    "version": (1, 3, 0),
+    "version": (1, 4, 0),
     "blender": (3, 6, 0),
     "location": "3D Viewport > Sidebar > VRM Fixer",
     "description": "把 mmd_shader / MMDShaderDev / MBTs-NG 卡渲材质转换为 VRM MToon1 并导出 VRM",
@@ -408,6 +408,189 @@ def normalize_helper_frames(context, tolerance=1.0):
     return changed, infos
 
 
+# ---------------------------------------------------------------------------
+# 烘焙 MMD 付与(约束驱动)骨骼 -> 真实父子层级
+# ---------------------------------------------------------------------------
+# MMD 模型里大量使用「付与」(bone inherit) 与 IK: 例如腿部皮肤实际绑在
+# 足D.L / ひざD.L 上, 而它们是靠 Blender 约束 (TRANSFORM) 跟随 足.L / ひざ.L 的。
+#
+# VRM/glTF 格式**没有约束**, 导出去之后这些骨骼就永远停在绑定姿势:
+# 表现就是「腿部/下半身绷直不动」, 而在 Blender 里怎么看都正常。
+#
+# 修法: 把"约束驱动"改成"真实父子关系"—— 让 足D.L 直接挂在 足.L 下面,
+# 并删掉那条约束(否则 Blender 里会双重变换)。静止世界坐标保持不变,
+# 所以模型外观不变; 但导出后 VRM 里的骨骼会跟着人形骨骼一起动。
+
+DRIVER_CONSTRAINT_TYPES = (
+    "TRANSFORM",
+    "COPY_TRANSFORMS",
+    "COPY_ROTATION",
+    "COPY_LOCATION",
+    "CHILD_OF",
+)
+
+
+def _driver_target(pbone):
+    """返回该骨骼上第一条"驱动型"约束的目标骨骼名。"""
+    for c in pbone.constraints:
+        if c.type in DRIVER_CONSTRAINT_TYPES:
+            name = getattr(c, "subtarget", "") or ""
+            if name:
+                return name, c
+    return None, None
+
+
+def _resolve_inherit_driver(armature_obj, bone_name, seen=None):
+    """顺着约束链找到真正驱动 bone_name 的骨骼。"""
+    seen = seen or set()
+    if bone_name in seen:
+        return None
+    seen.add(bone_name)
+    pbone = armature_obj.pose.bones.get(bone_name)
+    if pbone is None:
+        return None
+    target, _ = _driver_target(pbone)
+    if not target:
+        return bone_name
+    if target not in armature_obj.data.bones:
+        return bone_name
+    return _resolve_inherit_driver(armature_obj, target, seen) or bone_name
+
+
+def _nearest_humanoid_ancestor(bones, bone_name, humanoid_names):
+    node = bones.get(bone_name)
+    while node is not None:
+        if node.name in humanoid_names:
+            return node.name
+        node = node.parent
+    return None
+
+
+def _is_descendant(bones, maybe_child, ancestor):
+    node = bones.get(maybe_child)
+    while node is not None:
+        if node.name == ancestor:
+            return True
+        node = node.parent
+    return False
+
+
+def _subtree_has_humanoid(bones, root_name, humanoid_names):
+    """子树里是否含人形骨骼。含的话不能重挂, 否则会破坏 VRM 人形层级。"""
+    stack = [bones.get(root_name)]
+    while stack:
+        node = stack.pop()
+        if node is None:
+            continue
+        if node.name in humanoid_names:
+            return True
+        for child in node.children:
+            stack.append(child)
+    return False
+
+
+def scan_inherit_bones(armature_obj):
+    """找出所有"靠约束跟随人形骨骼"的骨骼, 返回计划列表。"""
+    humanoid_map = get_humanoid_bone_map(armature_obj)
+    humanoid_names = set(humanoid_map.values())
+    bones = armature_obj.data.bones
+    plan = []
+    for pb in armature_obj.pose.bones:
+        target, constraint = _driver_target(pb)
+        if not target:
+            continue
+        driver = _resolve_inherit_driver(armature_obj, pb.name)
+        if not driver:
+            continue
+        humanoid = _nearest_humanoid_ancestor(bones, driver, humanoid_names)
+        if not humanoid or humanoid == pb.name:
+            continue
+        if _is_descendant(bones, humanoid, pb.name):
+            continue  # 会形成环
+        if pb.bone.parent is not None and pb.bone.parent.name == humanoid:
+            continue  # 已经是对的了
+        if pb.name.startswith("_"):
+            continue  # mmd_tools 内部骨骼, 不导出, 跳过
+        if _subtree_has_humanoid(bones, pb.name, humanoid_names):
+            continue  # 子树含人形骨骼(如 肩C.L -> 腕.L), 重挂会破坏 VRM 人形层级
+        plan.append({
+            "bone": pb.name,
+            "new_parent": humanoid,
+            "driver": driver,
+            "constraint": constraint.name if constraint else "",
+        })
+    return plan
+
+
+def bake_mmd_inherit_bones(context):
+    """把付与驱动的骨骼重挂到人形骨骼下, 并删除对应约束。返回 (修改数, 日志)。"""
+    armature_obj, _body_obj = find_model_objects()
+    if armature_obj is None:
+        return 0, ["找不到骨骼对象"]
+    try:
+        if context.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+    except Exception:
+        pass
+
+    plan = scan_inherit_bones(armature_obj)
+    if not plan:
+        return 0, ["没有发现靠约束跟随的骨骼, 无需烘焙"]
+
+    infos = [f"  {i['bone']} <- {i['new_parent']} (原跟随 {i['driver']}, 约束 {i['constraint']})"
+             for i in plan]
+
+    prev_active = context.view_layer.objects.active
+    changed = 0
+    try:
+        bpy.ops.object.select_all(action="DESELECT")
+        armature_obj.select_set(True)
+        context.view_layer.objects.active = armature_obj
+        bpy.ops.object.mode_set(mode="EDIT")
+        edit_bones = armature_obj.data.edit_bones
+        for item in plan:
+            cb = edit_bones.get(item["bone"])
+            nb = edit_bones.get(item["new_parent"])
+            if cb is None or nb is None:
+                continue
+            head = cb.head.copy()
+            tail = cb.tail.copy()
+            roll = cb.roll
+            cb.parent = nb
+            cb.use_connect = False
+            cb.head = head
+            cb.tail = tail
+            cb.roll = roll
+            changed += 1
+        bpy.ops.object.mode_set(mode="OBJECT")
+    except Exception as exc:
+        try:
+            bpy.ops.object.mode_set(mode="OBJECT")
+        except Exception:
+            pass
+        infos.append(f"  烘焙失败: {exc}")
+        traceback.print_exc()
+        return 0, infos
+    finally:
+        try:
+            context.view_layer.objects.active = prev_active
+        except Exception:
+            pass
+
+    # 删掉驱动约束, 避免 Blender 里双重变换
+    removed = 0
+    for item in plan:
+        pb = armature_obj.pose.bones.get(item["bone"])
+        if pb is None:
+            continue
+        for c in list(pb.constraints):
+            if c.type in DRIVER_CONSTRAINT_TYPES and (getattr(c, "subtarget", "") or ""):
+                pb.constraints.remove(c)
+                removed += 1
+    infos.append(f"  重挂 {changed} 根骨骼, 删除 {removed} 条驱动约束")
+    return changed, infos
+
+
 def maybe_normalize_rig(context):
     """按场景开关执行骨骼朝向规范化, 返回日志行。"""
     lines = []
@@ -416,6 +599,15 @@ def maybe_normalize_rig(context):
             return lines
     except Exception:
         return lines
+    try:
+        if bool(getattr(context.scene, "vrm_fixer_bake_inherit", True)):
+            baked, bake_report = bake_mmd_inherit_bones(context)
+            lines.append(f"MMD 付与骨烘焙: 处理 {baked} 根骨骼")
+            lines.extend(bake_report)
+    except Exception:
+        traceback.print_exc()
+        lines.append("MMD 付与骨烘焙: 失败, 详见控制台")
+
     changed, report = normalize_helper_frames(context)
     lines.append(f"骨骼朝向规范化: 处理 {changed} 根 helper 骨骼")
     lines.extend(report)
@@ -571,11 +763,16 @@ def bake_mbts_and_export(context, output_path):
         for _rig_line in maybe_normalize_rig(context):
             print(f"[VRM Fixer] {_rig_line}")
 
-        bpy.ops.export_scene.vrm(
+        _export_result = bpy.ops.export_scene.vrm(
             filepath=output_path,
             armature_object_name=armature_obj.name,
             check_existing=False,
         )
+        if "FINISHED" not in _export_result:
+            print(f"[VRM Fixer] 导出被 VRM 插件拒绝(通常是人形骨骼层级校验失败): {_export_result}")
+            return False, ["VRM 导出被拒绝, 请看控制台的 Validation error"]
+        if not os.path.exists(output_path):
+            return False, ["VRM 导出后文件不存在, 请看控制台"]
         return True, infos
     finally:
         # 清理临时烘焙对象
@@ -858,6 +1055,7 @@ class VRMFIXER_PT_Panel(Panel):
         layout.prop(scene, "vrm_fixer_mode", text="导出模式")
         layout.prop(scene, "vrm_fixer_auto_bind_expressions", text="导出前自动绑定 VRM1 表情")
         layout.operator(VRMFIXER_OT_AutoBindExpressions.bl_idname)
+        layout.prop(scene, "vrm_fixer_bake_inherit", text="导出前烘焙 MMD 付与骨(修下半身僵住)")
         layout.prop(scene, "vrm_fixer_normalize_rig", text="导出前规范化骨骼朝向")
         layout.operator(VRMFIXER_OT_NormalizeRig.bl_idname)
         layout.prop(scene, "vrm_fixer_output_path", text="输出 VRM")
@@ -896,6 +1094,12 @@ def register():
         description="导出前自动把 VRM1 表情预设绑定到模型形状键",
         default=True,
     )
+    bpy.types.Scene.vrm_fixer_bake_inherit = BoolProperty(
+        name="导出前烘焙 MMD 付与骨",
+        description="把 MMD 模型里靠约束(付与)跟随人形骨骼的骨骼改成真实父子关系, "
+                    "否则导出 VRM 后这些部位(常见腿部/下半身)会僵在绑定姿势",
+        default=True,
+    )
     bpy.types.Scene.vrm_fixer_normalize_rig = BoolProperty(
         name="导出前规范化骨骼朝向",
         description="把 MMD 装备骨里夹在人形骨骼之间的 helper 骨骼朝向对齐, "
@@ -915,6 +1119,8 @@ def unregister():
         del bpy.types.Scene.vrm_fixer_auto_bind_expressions
     if hasattr(bpy.types.Scene, "vrm_fixer_mode"):
         del bpy.types.Scene.vrm_fixer_mode
+    if hasattr(bpy.types.Scene, "vrm_fixer_bake_inherit"):
+        del bpy.types.Scene.vrm_fixer_bake_inherit
     if hasattr(bpy.types.Scene, "vrm_fixer_normalize_rig"):
         del bpy.types.Scene.vrm_fixer_normalize_rig
     if hasattr(bpy.types.Scene, "vrm_fixer_output_path"):
